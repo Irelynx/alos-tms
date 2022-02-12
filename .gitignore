@@ -1,0 +1,5 @@
+png*/
+dataset/
+node_modules/
+.env
+meta.json
