@@ -10,38 +10,28 @@ const utils = require("./utils");
 const JSZIP = require('jszip');
 // const georaster = require("georaster/src");
 
-const datasetPath = './dataset';
-const outputPNGPath = './png';
-const emptyDataFileName = 'empty.png';
-
-const defaultMask = 0b11;
-const defaultHeight = 0;
-const heightMultiplier = 1; // (height + offset) * multiplier
-const heightOffset = 0; // meters, int16
-const reverseMask = false;
+import {
+    datasetPath,
+    outputPNGPath,
+    emptyDataFileName,
+    defaultMask,
+    defaultHeight,
+    heightMultiplier,
+    heightOffset,
+    reverseMask,
+    outputPNGLowResPath,
+    lowResFactor,
+    lowResAlgorithm,
+    inputFullSizePNGPath,
+} from "./dataset.options.mjs";
 
 function log(...args) {
     console.log(new Date().toISOString(), ...args);
 }
 
+/** @param {number} u - positive, uint8 number */
 function reverseBits(u) {
     return parseInt(('00000000' + u.toString(2)).slice(-8).split('').reverse().join(''), 2);
-}
-
-/*
-Takes in a flattened one dimensional array
-representing two-dimensional pixel values
-and returns an array of arrays.
-*/
-function unflatten(valuesInOneDimension, size) {
-    const {height, width} = size;
-    const valuesInTwoDimensions = [];
-    for (let y = 0; y < height; y++) {
-        const start = y * width;
-        const end = start + width;
-        valuesInTwoDimensions.push(valuesInOneDimension.slice(start, end));
-    }
-    return valuesInTwoDimensions;
 }
 
 /** @param {Array<Uint8Array | Uint16Array | Int8Array | Int16Array | Uint32Array | Int32Array | Float32Array | Float64Array>} arr2d */
@@ -80,7 +70,7 @@ async function getGeoTiff(buf, { noDataValue=null, disableStats=false }) {
     const resolutions = image.getResolution();
     const origin = image.getOrigin();
     const rasters = await image.readRasters();
-    const values = rasters.map(raster => unflatten(raster, {
+    const values = rasters.map(raster => utils.unflatten(raster, {
         height: image.fileDirectory.ImageLength,
         width: image.fileDirectory.ImageWidth
     }));
@@ -118,54 +108,6 @@ async function getGeoTiff(buf, { noDataValue=null, disableStats=false }) {
         },
     };
 }
-
-const maskDatasets = {
-    [0b00000000]: 'AW3D',
-    [0b00000100]: 'GSI DTM',
-    [0b00001000]: 'SRTM-1 v3',
-    [0b00001100]: 'PRISM DSM',
-    [0b00010000]: 'GSI ViewFinder Panoramas DEM',
-    [0b00011000]: 'ASTER GDEM v2',
-    [0b00011100]: 'ArcticDEM v2',
-    [0b00100000]: 'TanDEM-X 90m DEM',
-    [0b00100100]: 'ArcticDEM v3',
-    [0b00101000]: 'ASTER GDEM v3',
-    [0b00101100]: 'REMA v1.1',
-    [0b11111100]: 'IDW (gdal_fillnodata)',
-};
-
-function parseMaskValue(value) {
-    /*
-     * Mask information for ALOS DSM v3.2 (Jan 20222).
-     * Lower 1-2 bit: Valid/Invalid, Mask Information (Cloud and snow, Land water and low correlation, Sea)
-     * Lower 3-8 bit: Elevation dataset used for the void-filling processing, filled/not filled by IDW method*3
-     * Details of the mask:
-     *  000000 00 (0x00): Valid
-     *  000000 01 (0x01): Cloud and snow mask (invalid)
-     *  000000 10 (0x02): Land water and low correlation mask*4 (valid)
-     *  000000 11 (0x03): Sea mask*5 (valid)
-     *  000001 00 (0x04): GSI DTM*6 (valid)
-     *  000010 00 (0x08): SRTM-1 v3*7 (valid)
-     *  000011 00 (0x08): PRISM DSM (valid)
-     *  000100 00 (0x10): ViewFinder Panoramas DEM*8 (valid)
-     *  000110 00 (0x18): ASTER GDEM v2*9 (valid)
-     *  000111 00 (0x1C): ArcticDEM v2*10 (valid)
-     *  001000 00 (0x20): TanDEM-X 90m DEM*11 (valid)
-     *  001001 00 (0x24): ArcticDEM v3*10 (valid)
-     *  001010 00 (0x28): ASTER GDEM v3*9 (valid)
-     *  001011 00 (0x2C): REMA v1.1*12 (valid)
-     *  111111 00 (0xFC): applied IDW method (gdal_fillnodata) (valid)
-     */
-    return {
-        valid: (value & 0b11) !== 0b01,
-        landWater: (value & 0b11) === 0b10,
-        lowCorrelation: (value & 0b11) === 0b10,
-        sea: (value & 0b11) === 0b11,
-        dataset: maskDatasets[value & 0b11111100] || 'unknown',
-    };
-}
-
-// max height is 8848, min height is -11034 (under-water) or -3500 (on land)
 
 export async function loadDSMAndMSK(filePath) {
     const file = await fs.readFile(filePath).catch(e => e);
@@ -242,10 +184,33 @@ function streamClose(stream) {
     });
 }
 
+/**
+ * @param {NodeJS.EventEmitter} emitter
+ * @param {string} event
+ * @param {string} [rejectEvent]
+ */
+function waitForEvent(emitter, event, rejectEvent) {
+    return new Promise((resolve, reject) => {
+        emitter.on(event, resolve);
+        if (rejectEvent) emitter.on(rejectEvent, reject);
+    });
+}
+
+/**
+ * @param {...number} args
+ */
+function average(...args) {
+    let sum = 0;
+    for (let i=0; i<args.length; i++) {
+        sum += args[i];
+    }
+    return sum / args.length;
+}
+
 let emptyDataCreated = false;
 export async function generatePNGForEntireChunk({ lat, lon }) {
     const nsewString = utils.toNSEWString({ lat, lon });
-    const nsewRegion = utils.getRegion({ lat, lon });
+    // const nsewRegion = utils.getRegion({ lat, lon });
     const filePath = path.join(datasetPath, nsewString + '.zip');
     log(`reading ${nsewString}..`);
     const { geo, mask } = await loadDSMAndMSK(filePath);
@@ -263,7 +228,7 @@ export async function generatePNGForEntireChunk({ lat, lon }) {
         colorType: 2, // RGB only
         inputColorType: 2, // RGB only
         bitDepth: 8, // 1 Byte per channel
-        inputHasAlpha: 3, // no alpha
+        inputHasAlpha: false, // no alpha
         bgColor: seaMock,
         deflateLevel: 9,
     });
@@ -307,6 +272,173 @@ export async function generatePNGForEntireChunk({ lat, lon }) {
     log(`done`);
 }
 
+/**
+ * WARN: ALWAYS returns 4 channel image
+ */
+export async function loadPNGChunk({ lat, lon }) {
+    const nsewString = utils.toNSEWString({ lat, lon });
+    const filePath = path.join(inputFullSizePNGPath, nsewString + '.png');
+    const input = new PNG();
+    input.parse(await fs.readFile(filePath));
+    await waitForEvent(input, 'parsed');
+    return input;
+}
+
+export async function generateLowResPNGChunk({ lat, lon }) {
+    if (lowResFactor === 1) return;
+    if (lowResFactor !== 2 && lowResFactor !== 3) {
+        throw new Error(`Unsupported lowResFactor: ${lowResFactor}`);
+    }
+    if (lowResAlgorithm !== 'average' && lowResAlgorithm !== 'center' && lowResAlgorithm !== 'max') {
+        throw new Error(`Unsupported lowResAlgorithm: ${lowResAlgorithm}`);
+    }
+    let input;
+    try {
+        input = await loadPNGChunk({ lat, lon });
+    } catch (e) {
+        log(`Chunk not found. lat: ${lat}, lon: ${lon}`);
+        log(e);
+        return;
+    }
+    const channels = input.data.length / input.width / input.height;
+    if (channels !== 3 && channels !== 4) {
+        throw new Error(`Unexpected channels count for 1 Byte per channel image: ${channels}`);
+    }
+    const nsewString = utils.toNSEWString({ lat, lon });
+    const ow = input.width / lowResFactor;
+    const oh = input.height / lowResFactor;
+    const seaMock = {
+        red: defaultMask,
+        green: defaultHeight & 0x00ff,
+        blue: (defaultHeight & 0xff00) >> 8
+    };
+    const output = new PNG({
+        width: ow,
+        height: oh,
+        colorType: 2, // RGB only
+        inputColorType: 2, // RGB only
+        bitDepth: 8, // 1 Byte per channel
+        inputHasAlpha: false, // no alpha
+        bgColor: seaMock,
+        deflateLevel: 9,
+    });
+
+    if (lowResFactor === 2) {
+        if (lowResAlgorithm === 'center')
+        for (let y=0; y<oh; y++) {
+            for (let x=0; x<ow; x++) {
+                const r0 = (y * ow * lowResFactor + x) * lowResFactor * channels;
+                const oidx = (y * ow + x) * 3;
+                output.data.writeUInt8(input.data[r0], oidx);
+                output.data.writeInt16LE(input.data.readInt16LE(r0 + 1), oidx + 1);
+            }
+        }
+        if (lowResAlgorithm === 'average')
+        for (let y=0; y<oh; y++) {
+            for (let x=0; x<ow; x++) {
+                const r0 = (y * ow * lowResFactor + x) * lowResFactor * channels;
+                const r1 = (y * ow * lowResFactor + x + ow) * lowResFactor * channels;
+                const oidx = (y * ow + x) * 3;
+                // TODO: calculate mask properly
+                output.data.writeUInt8(Math.max(
+                    input.data[r0],
+                    input.data[r0 + channels],
+                    input.data[r1],
+                    input.data[r1 + channels],
+                ), oidx);
+                output.data.writeInt16LE(average(
+                    input.data.readInt16LE(r0 + 1),
+                    input.data.readInt16LE(r0 + channels + 1),
+                    input.data.readInt16LE(r1 + 1),
+                    input.data.readInt16LE(r1 + channels + 1),
+                ), oidx + 1);
+            }
+        }
+        if (lowResAlgorithm === 'max')
+        for (let y=0; y<oh; y++) {
+            for (let x=0; x<ow; x++) {
+                const r0 = (y * ow * lowResFactor + x) * lowResFactor * channels;
+                const r1 = (y * ow * lowResFactor + x + ow) * lowResFactor * channels;
+                const oidx = (y * ow + x) * 3;
+                // TODO: calculate mask properly
+                output.data.writeUInt8(Math.max(
+                    input.data[r0],
+                    input.data[r0 + channels],
+                    input.data[r1],
+                    input.data[r1 + channels],
+                ), oidx);
+                output.data.writeInt16LE(Math.max(
+                    input.data.readInt16LE(r0 + 1),
+                    input.data.readInt16LE(r0 + channels + 1),
+                    input.data.readInt16LE(r1 + 1),
+                    input.data.readInt16LE(r1 + channels + 1),
+                ), oidx + 1);
+            }
+        }
+    } else if (lowResFactor === 3) {
+        if (lowResAlgorithm === 'center')
+        for (let y=0; y<oh; y++) {
+            for (let x=0; x<ow; x++) {
+                const r1 = (y * ow * lowResFactor + x + ow) * lowResFactor * channels;
+                const oidx = (y * ow + x) * 3;
+                output.data.writeUInt8(input.data[r1 + channels], oidx);
+                output.data.writeInt16LE(input.data.readInt16LE(r1 + channels + 1), oidx + 1);
+            }
+        }
+        if (lowResAlgorithm === 'average')
+        for (let y=0; y<oh; y++) {
+            for (let x=0; x<ow; x++) {
+                const r0 = (y * ow * lowResFactor + x) * lowResFactor * channels;
+                const r1 = (y * ow * lowResFactor + x + ow) * lowResFactor * channels;
+                const r2 = (y * ow * lowResFactor + x + ow * 2) * lowResFactor * channels;
+                const oidx = (y * ow + x) * 3;
+                output.data.writeUInt8(input.data[r1 + channels], oidx);
+                output.data.writeInt16LE(average(
+                    input.data.readInt16LE(r0 + 1),
+                    input.data.readInt16LE(r0 + channels + 1),
+                    input.data.readInt16LE(r0 + channels * 2 + 1),
+                    input.data.readInt16LE(r1 + 1),
+                    input.data.readInt16LE(r1 + channels + 1),
+                    input.data.readInt16LE(r1 + channels * 2 + 1),
+                    input.data.readInt16LE(r2 + 1),
+                    input.data.readInt16LE(r2 + channels + 1),
+                    input.data.readInt16LE(r2 + channels * 2 + 1),
+                ), oidx + 1);
+            }
+        }
+        if (lowResAlgorithm === 'max')
+        for (let y=0; y<oh; y++) {
+            for (let x=0; x<ow; x++) {
+                const r0 = (y * ow * lowResFactor + x) * lowResFactor * channels;
+                const r1 = (y * ow * lowResFactor + x + ow) * lowResFactor * channels;
+                const r2 = (y * ow * lowResFactor + x + ow * 2) * lowResFactor * channels;
+                const oidx = (y * ow + x) * 3;
+                output.data.writeUInt8(input.data[r1 + channels], oidx);
+                output.data.writeInt16LE(Math.max(
+                    input.data.readInt16LE(r0 + 1),
+                    input.data.readInt16LE(r0 + channels + 1),
+                    input.data.readInt16LE(r0 + channels * 2 + 1),
+                    input.data.readInt16LE(r1 + 1),
+                    input.data.readInt16LE(r1 + channels + 1),
+                    input.data.readInt16LE(r1 + channels * 2 + 1),
+                    input.data.readInt16LE(r2 + 1),
+                    input.data.readInt16LE(r2 + channels + 1),
+                    input.data.readInt16LE(r2 + channels * 2 + 1),
+                ), oidx + 1);
+            }
+        }
+    }
+
+    const outputFilePath = path.join(`${outputPNGLowResPath}_${lowResFactor}_${lowResAlgorithm}`, nsewString + '.png');
+    log(`saving to ${outputFilePath}..`);
+    await fs.mkdir(path.parse(outputFilePath).dir, { recursive: true });
+    const outputFileStream = createWriteStream(outputFilePath);
+    output.pack().pipe(outputFileStream);
+    // stream.pipe(outputFile);
+    await streamClose(outputFileStream);
+    log(`done`);
+}
+
 
 async function main(args) {
     console.log(await getHeightByLatLon({
@@ -330,14 +462,15 @@ async function main2(args) {
     const stepLat = 1;
     const stepLon = 1;
     const totalChunks = (maxLat - minLat) / stepLat * (maxLon - minLon) / stepLon;
-    const startChunk = 56590;
+    const startChunk = 0;
     let chunk = 0;
     for (let lon = minLon; lon < maxLon; lon += stepLon) {
         for (let lat = minLat; lat < maxLat; lat += stepLat) {
             chunk++;
             if (chunk < startChunk) continue;
             log(`${chunk}/${totalChunks}\t${(chunk / totalChunks * 100).toFixed(2)}%\t${lat},${lon}`);
-            await generatePNGForEntireChunk({ lat, lon });
+            // await generatePNGForEntireChunk({ lat, lon });
+            await generateLowResPNGChunk({ lat, lon });
         }
     }
 }
@@ -348,4 +481,5 @@ export default {
     loadDSMAndMSK,
     getHeightByLatLon,
     generatePNGForEntireChunk,
+    loadPNGChunk,
 };

@@ -42,7 +42,6 @@ function fromNSEWString(str) {
 
 /**
  * @param {{ lat: number, lon: number }} param0
- * @param {typeof regions[i]} region
  */
 function getRegion({ lat, lon }, regionSectorSize=5) {
     // -85,-180 == S85W180 .. S80W175
@@ -66,10 +65,35 @@ function prepareURL(urlTemplate, object) {
     return urlTemplate;
 }
 
+/**
+ * asynchronous sleep (usage: `await sleep(time)`)
+ * @param {number} time_ms
+ * @returns {Promise<void>}
+ */
 function sleep(time_ms) {
     return new Promise((resolve) => {
         setTimeout(resolve, time_ms);
     });
+}
+
+/**
+ * Takes in a flattened one dimensional array
+ * representing two-dimensional pixel values
+ * and returns an array of arrays.
+ * @param {Array<any>} valuesInOneDimension
+ * @param {Object} size
+ * @param {number} size.height
+ * @param {number} size.width
+ */
+function unflatten(valuesInOneDimension, size) {
+    const {height, width} = size;
+    const valuesInTwoDimensions = [];
+    for (let y = 0; y < height; y++) {
+        const start = y * width;
+        const end = start + width;
+        valuesInTwoDimensions.push(valuesInOneDimension.slice(start, end));
+    }
+    return valuesInTwoDimensions;
 }
 
 if (module) {
@@ -80,5 +104,6 @@ if (module) {
         fromNSEWString,
         toNSEWString,
         parseRegions,
+        unflatten,
     };
 }
